@@ -1,0 +1,5 @@
+{
+  "name": "claude-mod-auto-voice",
+  "owner": { "name": "stha-hardik" },
+  "plugins": [{ "name": "auto-voice", "source": "./" }]
+}

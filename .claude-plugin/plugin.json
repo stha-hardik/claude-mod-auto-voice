@@ -1,0 +1,21 @@
+{
+  "name": "auto-voice",
+  "version": "0.7.0",
+  "description": "Reads every new line aloud as it appears, with a small pause/play and voice control above the prompt.",
+  "userConfig": {
+    "voice": {
+      "type": "string",
+      "title": "Voice",
+      "description": "Which Mac voice reads the replies aloud.",
+      "default": "System default",
+      "options": [
+        "System default",
+        "Samantha",
+        "Karen",
+        "Daniel",
+        "Aman"
+      ]
+    }
+  },
+  "types": "./types/index.d.ts"
+}
