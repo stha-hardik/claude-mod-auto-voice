@@ -6,8 +6,42 @@ const voiceChoice = atom({ plugin: 'auto-voice', key: 'voice' } as const, null)
 const isSpeaking = atom({ plugin: 'auto-voice', key: 'isSpeaking' } as const, false)
 const isActive = atom({ plugin: 'auto-voice', key: 'isActive' } as const, false)
 const marker = atom({ plugin: 'auto-voice', key: 'marker' } as const, '')
+const isMuted = atom({ plugin: 'auto-voice', key: 'isMuted' } as const, false)
+const isTipShown = atom({ plugin: 'auto-voice', key: 'isTipShown' } as const, false)
 
-const VOICES = ['System default', 'Samantha', 'Karen', 'Daniel', 'Aman']
+const VOICE_SETTINGS = 'x-apple.systempreferences:com.apple.Accessibility-Settings.extension?SpokenContent'
+const TIP_KEY = 'voiceTipDismissed'
+
+// System default, then up to four natural-sounding voices found on this Mac: Siri voices and the
+// Premium or Enhanced ones from System Settings. The older robotic voices are left out.
+const MAX_NATURAL = 4
+let voices = ['System default']
+let hasListed = false
+
+const shortName = (voice: string) => voice.replace(/\s*\(.*\)\s*$/, '')
+
+async function listVoices($: EngineInterface) {
+  if (hasListed) return
+  hasListed = true
+  try {
+    const out = await $.process.run(['say', '-v', '?'])
+    const found: string[] = []
+    for (const line of out.stdout.split('\n')) {
+      const m = line.match(/^(.+?)\s+(en_[A-Z]+)\s+#(.*)$/)
+      const name = m?.[1]?.trim()
+      if (!name || found.includes(name)) continue
+      if (/\((Premium|Enhanced)\)/.test(name) || /Siri/.test(m?.[3] ?? '')) found.push(name)
+    }
+    voices = ['System default', ...found.slice(0, MAX_NATURAL)]
+  } catch {
+    hasListed = false
+  }
+  const chosen = await read($, voiceChoice)
+  if (chosen !== null && !voices.includes(chosen)) await update($, voiceChoice, () => null)
+  const hasDismissed = await $.store.get(TIP_KEY).then(v => v === true, () => false)
+  await update($, isTipShown, () => voices.length - 1 < MAX_NATURAL && !hasDismissed)
+  if (!voices.includes(defaultVoice)) defaultVoice = 'System default'
+}
 
 const toSpeech = (text: string) =>
   text
@@ -136,7 +170,7 @@ async function currentVoice($: EngineInterface): Promise<string | undefined> {
 }
 
 // Renders the section to a temporary sound file to measure how loud each moment is, for the wave.
-// It takes a second or two, so it runs ahead, while the section before is being spoken.
+// It takes a second or two, so it runs ahead, at low priority, while the section before is being spoken.
 async function measure($: EngineInterface, text: string, voice: string | undefined): Promise<Loudness | null> {
   if (!canRunSay) return null
   fileCount += 1
@@ -144,7 +178,8 @@ async function measure($: EngineInterface, text: string, voice: string | undefin
   const wav = '/tmp/auto-voice-' + id + '.wav'
   try {
     const toFile = ['-o', wav, '--file-format=WAVE', '--data-format=LEI16@8000', '-f', '-']
-    await $.process.run(voice ? ['say', '-v', voice, ...toFile] : ['say', ...toFile], { stdin: text, timeoutMs: 20000 })
+    const render = voice ? ['say', '-v', voice, ...toFile] : ['say', ...toFile]
+    await $.process.run(['taskpolicy', '-c', 'background', ...render], { stdin: text, timeoutMs: 20000 })
     const out = await $.process.run(['python3', '-c', MEASURE, wav, String(DOTS)])
     const [seconds, list] = out.stdout.trim().split(' ')
     const amps = (list ?? '').split(',').map(Number)
@@ -198,21 +233,31 @@ async function stopReading($: EngineInterface) {
   }
 }
 
+// Paused (this reply) or muted (the whole session): either way, nothing is read.
+async function isQuiet($: EngineInterface): Promise<boolean> {
+  return (await read($, isPaused)) || (await read($, isMuted))
+}
+
 async function readLoop($: EngineInterface, myGen: number) {
   try {
     await showState($)
     for (;;) {
-      if (myGen !== gen || (await read($, isPaused))) return
+      if (myGen !== gen || (await isQuiet($))) return
       const sections = turns[cursor.turn]?.sections ?? []
       if (cursor.section >= sections.length) return
       const text = sections[cursor.section] ?? ''
       await showState($)
       const voice = await currentVoice($)
       loudness = measured.get((voice ?? '') + '|' + text) ?? estimate(text)
-      void prepare($, text, voice) // for a later replay of this one
-      void prepare($, sections[cursor.section + 1], voice) // ready by the time this one ends
+      // Measure the next section a moment after this one starts: rendering sound while the voice
+      // is starting makes it stutter, and two seconds in it no longer does (tested on every voice).
+      const upcoming = sections[cursor.section + 1]
+      const here = cursor
+      $.clock.after(2000, () => {
+        if (myGen === gen && cursor === here) void prepare($, upcoming, voice)
+      })
       await update($, isSpeaking, () => true)
-      if (myGen !== gen || (await read($, isPaused))) return
+      if (myGen !== gen || (await isQuiet($))) return
       await speak($, text, voice)
       await update($, isSpeaking, () => false)
       if (myGen !== gen) return
@@ -251,6 +296,7 @@ async function jumpTo($: EngineInterface, turn: number, section: number) {
   gen += 1
   cursor = { turn, section }
   await update($, isPaused, () => false)
+  await update($, isMuted, () => false) // pressing play, previous or next means: read this
   await silence($)
   await showState($)
   const myGen = gen
@@ -279,9 +325,9 @@ async function pressNext($: EngineInterface) {
 }
 
 async function pressPlayPause($: EngineInterface) {
-  const paused = await read($, isPaused)
+  const quiet = await isQuiet($)
   const busy = reader !== null || turns[cursor.turn]?.isLive === true
-  if (!paused && busy) {
+  if (!quiet && busy) {
     await update($, isPaused, () => true)
     await stopReading($)
     await showState($)
@@ -295,9 +341,37 @@ async function pressPlayPause($: EngineInterface) {
   return jumpTo($, turn, isDone ? 0 : cursor.section)
 }
 
+// The session mute: stops this session's voice for good, across replies, until pressed again
+// (or until play, previous or next is pressed). Other sessions keep talking.
+async function pressMute($: EngineInterface) {
+  const now = !(await read($, isMuted))
+  await update($, isMuted, () => now)
+  if (now) await stopReading($)
+  await showState($)
+}
+
+async function dismissTip($: EngineInterface) {
+  await $.store.set(TIP_KEY, true)
+  await update($, isTipShown, () => false)
+}
+
+async function openVoiceSettings($: EngineInterface) {
+  await $.process.run(['open', VOICE_SETTINGS]).catch(() => {})
+  await dismissTip($)
+}
+
+let lastStatus: string | undefined
+
+function showStatus($: EngineInterface, text: string | undefined) {
+  if (text === lastStatus) return
+  lastStatus = text
+  $.ui.status(text)
+}
+
 async function pressVoice($: EngineInterface) {
+  await listVoices($)
   const cur = (await read($, voiceChoice)) ?? defaultVoice
-  const picked = VOICES[(VOICES.indexOf(cur) + 1) % VOICES.length]
+  const picked = voices[(voices.indexOf(cur) + 1) % voices.length] ?? 'System default'
   await update($, voiceChoice, () => picked)
 }
 
@@ -316,10 +390,11 @@ async function addMessage($: EngineInterface, text: string) {
   turns[live]?.sections.push(...sections)
   if (cursor.turn < 0) cursor = { turn: live, section: 0 }
   await showState($)
-  if (cursor.turn === live && !(await read($, isPaused))) await pump($, gen)
+  if (cursor.turn === live && !(await isQuiet($))) await pump($, gen)
 }
 
 async function startTurn($: EngineInterface) {
+  await listVoices($)
   const current = turns[live]
   if (current) current.isLive = false
   await stopReading($)
@@ -340,6 +415,12 @@ async function endTurn($: EngineInterface, isAborted: boolean) {
 
 export const register: Register = (on, options) => {
   defaultVoice = typeof options.voice === 'string' ? options.voice : 'System default'
+
+  on('session.start', async ($, e, next) => {
+    const started = await next(e)
+    await listVoices($)
+    return started
+  })
 
   on('turn.start', async ($, e, next) => {
     if (e.agentId === undefined) await startTurn($)
@@ -369,19 +450,31 @@ export const register: Register = (on, options) => {
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (e.props.hasSurvey) return next(e)
     const paused = await read($, isPaused)
     const speaking = await read($, isSpeaking)
     const active = await read($, isActive)
     const voice = (await read($, voiceChoice)) ?? defaultVoice
     const position = await read($, marker)
+    const muted = await read($, isMuted)
+    const tip = await read($, isTipShown)
+    const voiceLabel = `Voice: ${voice === 'System default' ? 'Default' : shortName(voice)}`
+
+    // A question from Claude holds the band, so the bar steps aside; a line under the prompt keeps
+    // showing what the voice is doing until the question is answered.
+    if (e.props.hasSurvey) {
+      const state = muted ? 'muted' : paused ? 'paused' : speaking ? 'reading' : 'ready'
+      showStatus($, `${muted ? '🔇' : '🔊'} auto-voice · ${state}${position ? ' ' + position : ''} · ${voiceLabel}`)
+      return next(e)
+    }
+    showStatus($, undefined)
     const table = $.ui.resolve(e)
     const { Box, Text, Button } = table
-    const isOn = !paused && active
+    const isOn = !paused && !muted && active
 
     return (
       <Box width="100%" alignItems="center">
-        <Text dimColor>♪ </Text>
+        <Button key="mute" label={muted ? '🔇' : '🔊'} plain={true} onPress={() => pressMute($)} />
+        <Text> </Text>
         <Button key="prev" label="⏮" onPress={() => pressPrevious($)} />
         <Text> </Text>
         <Button key="toggle" label={isOn ? '⏸' : '▶'} onPress={() => pressPlayPause($)} />
@@ -390,12 +483,21 @@ export const register: Register = (on, options) => {
         <Text dimColor> {position} </Text>
         <Box flexGrow={1} overflow="hidden">
           {'Svg' in table ? (
-            <table.Svg source={waveSvg(speaking && !paused, loudness)} alt="Voice wave" width={WIDTH} height={19} isInteractive={true} />
+            <table.Svg source={waveSvg(speaking && !paused && !muted, loudness)} alt="Voice wave" width={WIDTH} height={19} isInteractive={true} />
           ) : (
             <Text dimColor>{speaking && !paused ? '●●●●●●●●' : '········'}</Text>
           )}
         </Box>
-        <Button key="voice" label={voice} onPress={() => pressVoice($)} />
+        {tip ? (
+          <Box alignItems="center">
+            <Button key="tip-get" label="Get natural voices" dimColor={true} onPress={() => openVoiceSettings($)} />
+            <Button key="tip-close" label="×" plain={true} dimColor={true} onPress={() => dismissTip($)} />
+            <Text> </Text>
+          </Box>
+        ) : (
+          <Text> </Text>
+        )}
+        <Button key="voice" label={voiceLabel} onPress={() => pressVoice($)} />
       </Box>
     )
   })

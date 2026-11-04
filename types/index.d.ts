@@ -8,6 +8,8 @@ declare module 'claude-code' {
       isSpeaking: boolean
       isActive: boolean
       marker: string
+      isMuted: boolean
+      isTipShown: boolean
     }
   }
 }

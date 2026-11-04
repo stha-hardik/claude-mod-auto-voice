@@ -1,20 +1,17 @@
 {
   "name": "auto-voice",
-  "version": "0.7.0",
-  "description": "Reads every new line aloud as it appears, with a small pause/play and voice control above the prompt.",
+  "version": "1.0.0",
+  "description": "Reads Claude Code's replies aloud as they appear, section by section, with a small player bar: mute, skip, pause and natural voices.",
+  "author": {
+    "name": "Hardik Shrestha"
+  },
+  "license": "MIT",
   "userConfig": {
     "voice": {
       "type": "string",
       "title": "Voice",
-      "description": "Which Mac voice reads the replies aloud.",
-      "default": "System default",
-      "options": [
-        "System default",
-        "Samantha",
-        "Karen",
-        "Daniel",
-        "Aman"
-      ]
+      "description": "The voice to start with: System default, or the exact name of a natural voice on this Mac, such as 'Ava (Premium)'.",
+      "default": "System default"
     }
   },
   "types": "./types/index.d.ts"
