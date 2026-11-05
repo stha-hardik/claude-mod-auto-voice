@@ -38,6 +38,10 @@ In the desktop app, where `/plugin` does not run: click + next to the prompt box
 
 Answer `y` to add the marketplace, then pick the user scope so it works in every session. Open a new chat afterwards.
 
+## Get updates
+
+New mods and updates first, by email: [Hardik Shrestha](https://shresthahardik.substack.com)
+
 ## Better voices
 
 Apple's natural voices are free. Open **System Settings → Accessibility → Read & Speak** (called Spoken Content on older macOS), click the **(i)** next to **System Voice**, then **Manage Voices**, and download English voices marked **Premium** or **Enhanced**. auto-voice picks them up in your next session.
