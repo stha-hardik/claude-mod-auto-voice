@@ -1,3 +1,5 @@
+<img src="logo.jpg" alt="auto-voice logo" width="120">
+
 # auto-voice
 
 A Claude Code mod that reads Claude's replies aloud as they appear, so you never have to click a speaker button.
@@ -53,3 +55,5 @@ The starting voice can also be set in the config menu, under **auto-voice → Vo
 ## Licence
 
 MIT. See [LICENSE](LICENSE).
+
+![Make Claude Speak.](cover.jpg)
