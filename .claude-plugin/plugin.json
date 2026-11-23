@@ -1,6 +1,6 @@
 {
   "name": "auto-voice",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Reads Claude Code's replies aloud as they appear, section by section, with a small player bar: mute, skip, pause and natural voices.",
   "author": {
     "name": "Hardik Shrestha"

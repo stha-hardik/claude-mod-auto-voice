@@ -8,9 +8,13 @@ const isActive = atom({ plugin: 'auto-voice', key: 'isActive' } as const, false)
 const marker = atom({ plugin: 'auto-voice', key: 'marker' } as const, '')
 const isMuted = atom({ plugin: 'auto-voice', key: 'isMuted' } as const, false)
 const isTipShown = atom({ plugin: 'auto-voice', key: 'isTipShown' } as const, false)
+const volume = atom({ plugin: 'auto-voice', key: 'volume' } as const, 1)
+const isVolumeOpen = atom({ plugin: 'auto-voice', key: 'isVolumeOpen' } as const, false)
+const isSettingsOpen = atom({ plugin: 'auto-voice', key: 'isSettingsOpen' } as const, false)
 
 const VOICE_SETTINGS = 'x-apple.systempreferences:com.apple.Accessibility-Settings.extension?SpokenContent'
 const TIP_KEY = 'voiceTipDismissed'
+const VOLUME_KEY = 'volume'
 
 // System default, then up to four natural-sounding voices found on this Mac: Siri voices and the
 // Premium or Enhanced ones from System Settings. The older robotic voices are left out.
@@ -148,8 +152,21 @@ let live = -1 // the turn the model is working on now, or -1
 let cursor = { turn: -1, section: 0 } // the section being read, or the next one to read
 let gen = 0
 let reader: Promise<void> | null = null
+let resume = { turn: -1, section: 0, word: 0 } // where a section stopped for a volume change goes on from
 let readerGen = -1
-let canRunSay = true // false once the host refuses to run `say`; $.audio.speak is used instead
+let canRunSay = true // false when the host refuses `say` from the start; $.audio.speak is used instead
+let hasSaid = false // `say` has run here at least once, so a later failure is a one-off, not a refusal
+let lastFailure = ''
+// Set by the reader while a section plays; a volume change calls it. The slider's messages come from
+// code, not from the person, so they never run commands themselves: the reader, started by the
+// person, stops the voice and reads the section again at the new volume.
+let onVolumeChange: (() => void) | null = null
+let lastVolumeChange = 0 // when the volume last changed, so the pause after one waits out the next
+const RESUME_PAUSE_MS = 2000 // after a volume change, the voice waits this long, then resumes
+const RESUME_SENTENCE_WORDS = 30 // and reads the sentence again from its start, unless that is further back than this
+const RESUME_BACK_WORDS = 5 // then it goes back this many words instead,
+const RESUME_SNAP_WORDS = 5 // and up to this many more, to start just after a comma
+const SAY_START_SECONDS = 0.5 // about how long `say` takes before the first word is heard
 const heard = new Set<string>() // messages of this turn already added, so the last one is not added twice
 
 function lastSpoken(): number {
@@ -205,22 +222,96 @@ async function prepare($: EngineInterface, text: string | undefined, voice: stri
   if (loud) measured.set(key, loud)
 }
 
+// ---- Volume ----
+//
+// Most Mac voices take a volume inside the text (`[[volm 0.5]]`). Siri voices ignore it, so for
+// those the section is rendered to a sound file and played with `afplay` at the volume instead.
+// Which kind a voice is gets found out once, by rendering a few words at two volumes.
+
+const PROBE = 'import wave,struct,sys\nw=wave.open(sys.argv[1]);n=w.getnframes();s=struct.unpack("<%dh"%n,w.readframes(n))\nprint(int((sum(x*x for x in s)/max(n,1))**.5))'
+const takesVolm = new Map<string, boolean>()
+let playTag = 'x' // names this session's playback files, so stopping never touches another session's
+
+async function loudnessOf($: EngineInterface, text: string, voice: string | undefined): Promise<number> {
+  fileCount += 1
+  const wav = '/tmp/auto-voice-probe-' + playTag + '-' + fileCount + '.wav'
+  try {
+    const toFile = ['-o', wav, '--file-format=WAVE', '--data-format=LEI16@8000', '-f', '-']
+    await $.process.run(voice ? ['say', '-v', voice, ...toFile] : ['say', ...toFile], { stdin: text, timeoutMs: 20000 })
+    const out = await $.process.run(['python3', '-c', PROBE, wav])
+    return Number(out.stdout.trim())
+  } finally {
+    await $.process.run(['rm', '-f', wav]).catch(() => {})
+  }
+}
+
+async function voiceTakesVolm($: EngineInterface, voice: string | undefined): Promise<boolean> {
+  const known = takesVolm.get(voice ?? '')
+  if (known !== undefined) return known
+  try {
+    const full = await loudnessOf($, 'Testing the volume, one two three.', voice)
+    const low = await loudnessOf($, '[[volm 0.2]] Testing the volume, one two three.', voice)
+    if (!(full > 0) || !(low >= 0)) return true // could not tell: the volume inside the text is the safe guess
+    const answer = low < full * 0.6
+    takesVolm.set(voice ?? '', answer)
+    return answer
+  } catch {
+    return true
+  }
+}
+
+const DOT_LEVELS = [20, 40, 60, 80, 100] // what each volume dot sets, in percent (no-slider surfaces)
+
+const speakerIcon = (muted: boolean, level: number) =>
+  muted ? '🔇' : level < 0.34 ? '🔈' : level < 0.67 ? '🔉' : '🔊'
+
 // Speaks one section and resolves when it has ended or been stopped.
-async function speak($: EngineInterface, text: string, voice: string | undefined) {
+async function speak($: EngineInterface, text: string, voice: string | undefined, isCurrent: () => boolean) {
   if (canRunSay) {
     try {
-      const argv = voice ? ['say', '-v', voice, '-f', '-'] : ['say', '-f', '-']
-      await $.process.run(argv, { stdin: text, timeoutMs: 600000 })
+      const level = await read($, volume)
+      const named = voice ? ['say', '-v', voice] : ['say']
+      if (level >= 0.995) {
+        await $.process.run([...named, '-f', '-'], { stdin: text, timeoutMs: 600000 })
+        hasSaid = true
+        return
+      }
+      if (await voiceTakesVolm($, voice)) {
+        if (!isCurrent()) return
+        await $.process.run([...named, '-f', '-'], { stdin: `[[volm ${level.toFixed(2)}]] ${text}`, timeoutMs: 600000 })
+        hasSaid = true
+        return
+      }
+      fileCount += 1
+      const file = '/tmp/auto-voice-play-' + playTag + '-' + fileCount + '.aiff'
+      try {
+        await $.process.run([...named, '-o', file, '-f', '-'], { stdin: text, timeoutMs: 120000 })
+        if (!isCurrent()) return
+        await $.process.run(['afplay', '-v', level.toFixed(2), file], { timeoutMs: 600000 })
+        hasSaid = true
+      } finally {
+        await $.process.run(['rm', '-f', file]).catch(() => {})
+      }
       return
-    } catch {
-      canRunSay = false
+    } catch (err) {
+      // Refused from the start: the host does not let the mod run `say`, so the engine speaks instead.
+      // After `say` has worked, a failure is a one-off: say why once, and try `say` again next time.
+      if (!hasSaid) canRunSay = false
+      else {
+        const why = String(err).slice(0, 100)
+        if (why !== lastFailure) $.ui.toast(`auto-voice: the voice failed (${why})`)
+        lastFailure = why
+        return
+      }
     }
   }
   await $.audio.speak(text, { voice }).catch(() => {})
 }
 
 async function silence($: EngineInterface) {
-  if (canRunSay) await $.process.run(['pkill', '-x', 'say']).catch(() => {})
+  if (!canRunSay && !hasSaid) return
+  await $.process.run(['pkill', '-x', 'say']).catch(() => {})
+  await $.process.run(['pkill', '-f', '/tmp/auto-voice-play-' + playTag + '-']).catch(() => {})
 }
 
 // Stops the voice for good: a reader that started its `say` just after the first stop is stopped again.
@@ -238,6 +329,21 @@ async function isQuiet($: EngineInterface): Promise<boolean> {
   return (await read($, isPaused)) || (await read($, isMuted))
 }
 
+// The start of the sentence the voice was stopped in, so it is heard again whole. In a very long
+// sentence, a few words back instead, moved to just after a comma when one is close.
+function resumePoint(words: string[], reached: number): number {
+  // The estimate can run a word or two ahead, into the next sentence: count from a little before it.
+  const at = Math.max(0, Math.min(reached, words.length) - 2)
+  for (let i = at; i >= 0 && at - i <= RESUME_SENTENCE_WORDS; i -= 1) {
+    if (i === 0 || /[.!?]["')\]]*$/.test(words[i - 1] ?? '')) return i
+  }
+  const back = Math.max(0, reached - RESUME_BACK_WORDS)
+  for (let i = Math.min(back + 1, reached); i > Math.max(0, back - RESUME_SNAP_WORDS); i -= 1) {
+    if (/[.,;:!?]$/.test(words[i - 1] ?? '')) return i
+  }
+  return back
+}
+
 async function readLoop($: EngineInterface, myGen: number) {
   try {
     await showState($)
@@ -245,10 +351,17 @@ async function readLoop($: EngineInterface, myGen: number) {
       if (myGen !== gen || (await isQuiet($))) return
       const sections = turns[cursor.turn]?.sections ?? []
       if (cursor.section >= sections.length) return
-      const text = sections[cursor.section] ?? ''
+      const full = sections[cursor.section] ?? ''
+      const words = full.split(/\s+/).filter(Boolean)
+      if (resume.turn !== cursor.turn || resume.section !== cursor.section) resume = { ...cursor, word: 0 }
+      const from = Math.min(resume.word, Math.max(0, words.length - 1))
+      const text = from > 0 ? words.slice(from).join(' ') : full
       await showState($)
       const voice = await currentVoice($)
-      loudness = measured.get((voice ?? '') + '|' + text) ?? estimate(text)
+      // How long the whole section takes: measured where it could be, else estimated from its words.
+      const whole = measured.get((voice ?? '') + '|' + full) ?? estimate(full)
+      const seconds = (whole.seconds * (words.length - from)) / Math.max(1, words.length)
+      loudness = from > 0 ? { seconds, amps: estimate(text).amps } : whole
       // Measure the next section a moment after this one starts: rendering sound while the voice
       // is starting makes it stutter, and two seconds in it no longer does (tested on every voice).
       const upcoming = sections[cursor.section + 1]
@@ -258,12 +371,41 @@ async function readLoop($: EngineInterface, myGen: number) {
       })
       await update($, isSpeaking, () => true)
       if (myGen !== gen || (await isQuiet($))) return
-      await speak($, text, voice)
+      let isChanged = false
+      const changed = new Promise<void>(done => {
+        onVolumeChange = () => {
+          isChanged = true
+          done()
+        }
+      })
+      const startedAt = await $.clock.now()
+      const speaking = speak($, text, voice, () => myGen === gen && !isChanged)
+      await Promise.race([speaking, changed])
+      if (isChanged) {
+        // Where it had got to, from how long it had spoken out of how long this part takes.
+        const spoken = Math.max(0, ((await $.clock.now()) - startedAt) / 1000 - SAY_START_SECONDS)
+        const reached = Math.floor(Math.min(1, spoken / Math.max(0.5, seconds)) * (words.length - from))
+        await silence($)
+        resume = { ...cursor, word: resumePoint(words, from + reached) }
+      }
+      await speaking
+      onVolumeChange = null
       await update($, isSpeaking, () => false)
       if (myGen !== gen) return
+      if (isChanged) {
+        // Wait until the volume has been left alone for a moment, then go on from a few words back.
+        for (;;) {
+          const wait = lastVolumeChange + RESUME_PAUSE_MS - (await $.clock.now())
+          if (wait <= 0) break
+          await $.clock.sleep(wait)
+          if (myGen !== gen) return
+        }
+        continue
+      }
       cursor = { turn: cursor.turn, section: cursor.section + 1 }
     }
   } finally {
+    onVolumeChange = null
     await update($, isSpeaking, () => false)
   }
 }
@@ -295,6 +437,7 @@ async function pump($: EngineInterface, myGen: number) {
 async function jumpTo($: EngineInterface, turn: number, section: number) {
   gen += 1
   cursor = { turn, section }
+  resume = { turn: -1, section: 0, word: 0 } // a jump reads the section from its start
   await update($, isPaused, () => false)
   await update($, isMuted, () => false) // pressing play, previous or next means: read this
   await silence($)
@@ -350,6 +493,31 @@ async function pressMute($: EngineInterface) {
   await showState($)
 }
 
+// From the slider (which stays open to adjust again) or the dots (which close once picked):
+// sets the level and unmutes. The section being read starts again at the
+// new volume, so the change is heard at once.
+async function setVolume($: EngineInterface, percent: number, close = true) {
+  const wasMuted = await read($, isMuted)
+  const wasSpeaking = await read($, isSpeaking)
+  const level = Math.max(0.05, Math.min(1, percent / 100))
+  const before = await read($, volume)
+  if (close) await update($, isVolumeOpen, () => false)
+  await update($, volume, () => level)
+  lastVolumeChange = await $.clock.now()
+  await $.store.set(VOLUME_KEY, level).catch(() => {})
+  if (wasMuted) {
+    await update($, isMuted, () => false)
+    await showState($)
+    return
+  }
+  if (wasSpeaking && Math.abs(before - level) > 0.004) onVolumeChange?.()
+}
+
+async function loadVolume($: EngineInterface) {
+  const saved = await $.store.get(VOLUME_KEY).catch(() => undefined)
+  if (typeof saved === 'number' && saved > 0 && saved <= 1) await update($, volume, () => saved)
+}
+
 async function dismissTip($: EngineInterface) {
   await $.store.set(TIP_KEY, true)
   await update($, isTipShown, () => false)
@@ -368,11 +536,21 @@ function showStatus($: EngineInterface, text: string | undefined) {
   $.ui.status(text)
 }
 
-async function pressVoice($: EngineInterface) {
-  await listVoices($)
-  const cur = (await read($, voiceChoice)) ?? defaultVoice
-  const picked = voices[(voices.indexOf(cur) + 1) % voices.length] ?? 'System default'
+// From the settings panel: the voice picked is used from the next section on.
+async function pickVoice($: EngineInterface, picked: string) {
   await update($, voiceChoice, () => picked)
+}
+
+// The Volume and settings buttons each open in the wave's place, so opening one closes the other.
+async function toggleSettings($: EngineInterface) {
+  await listVoices($)
+  await update($, isVolumeOpen, () => false)
+  await update($, isSettingsOpen, open => !open)
+}
+
+async function toggleVolume($: EngineInterface) {
+  await update($, isSettingsOpen, () => false)
+  await update($, isVolumeOpen, open => !open)
 }
 
 function openTurn(): number {
@@ -418,8 +596,20 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
+    playTag = String(await $.clock.now()) + '-' + Math.floor(Math.random() * 1e6)
+    await loadVolume($)
     await listVoices($)
     return started
+  })
+
+
+  // The slider reports a level when the mouse button comes up, or an arrow key is pressed.
+  on('ui.message', async ($, e, next) => {
+    if (e.element !== 'volume-slider') return next(e)
+    const data = e.data as { level?: unknown } | null
+    if (typeof data?.level !== 'number' || !Number.isFinite(data.level)) return {}
+    await setVolume($, Math.max(5, Math.min(100, Math.round(data.level))), false)
+    return { props: { level: Math.round((await read($, volume)) * 100) } }
   })
 
   on('turn.start', async ($, e, next) => {
@@ -457,23 +647,29 @@ export const register: Register = (on, options) => {
     const position = await read($, marker)
     const muted = await read($, isMuted)
     const tip = await read($, isTipShown)
+    const level = await read($, volume)
+    const icon = speakerIcon(muted, level)
+    const volumeOpen = await read($, isVolumeOpen)
+    const percentText = muted ? 'muted' : `${Math.round(level * 100)}%`
+    const settingsOpen = await read($, isSettingsOpen)
     const voiceLabel = `Voice: ${voice === 'System default' ? 'Default' : shortName(voice)}`
 
     // A question from Claude holds the band, so the bar steps aside; a line under the prompt keeps
     // showing what the voice is doing until the question is answered.
     if (e.props.hasSurvey) {
       const state = muted ? 'muted' : paused ? 'paused' : speaking ? 'reading' : 'ready'
-      showStatus($, `${muted ? '🔇' : '🔊'} auto-voice · ${state}${position ? ' ' + position : ''} · ${voiceLabel}`)
+      showStatus($, `${icon} auto-voice · ${state}${position ? ' ' + position : ''} · ${voiceLabel}`)
       return next(e)
     }
     showStatus($, undefined)
     const table = $.ui.resolve(e)
     const { Box, Text, Button } = table
     const isOn = !paused && !muted && active
+    const canSlide = e.surface === 'desktop' || e.surface === 'terminal' // the surfaces that draw a Client
 
     return (
       <Box width="100%" alignItems="center">
-        <Button key="mute" label={muted ? '🔇' : '🔊'} plain={true} onPress={() => pressMute($)} />
+        <Button key="mute" label={icon} plain={true} onPress={() => pressMute($)} />
         <Text> </Text>
         <Button key="prev" label="⏮" onPress={() => pressPrevious($)} />
         <Text> </Text>
@@ -482,22 +678,51 @@ export const register: Register = (on, options) => {
         <Button key="next" label="⏭" onPress={() => pressNext($)} />
         <Text dimColor> {position} </Text>
         <Box flexGrow={1} overflow="hidden">
-          {'Svg' in table ? (
+          {/* While the Volume button is open, the volume slider takes the wave's place, end to end. */}
+          {volumeOpen && canSlide && 'Client' in table ? (
+            <table.Client key="volume-slider" module="./slider.tsx" width="100%" height={1} flexGrow={1} props={{ level: Math.round(level * 100) }} />
+          ) : settingsOpen ? (
+            // Settings: the voices to pick from, and a way to get more, in the wave's place.
+            <Box width="100%" alignItems="center">
+              <Text dimColor>Voice </Text>
+              {voices.map((name, i) => (
+                <Box key={`voice-row-${i}`} alignItems="center" flexShrink={0}>
+                  <Button
+                    key={`voice-${i}`}
+                    label={(name === voice ? '✓ ' : '') + (name === 'System default' ? 'Default' : shortName(name))}
+                    dimColor={name !== voice}
+                    onPress={() => pickVoice($, name)}
+                  />
+                  <Text> </Text>
+                </Box>
+              ))}
+              <Box flexGrow={1} />
+              <Button key="tip-get" label="Get more voices" dimColor={!tip} onPress={() => openVoiceSettings($)} />
+            </Box>
+          ) : 'Svg' in table ? (
             <table.Svg source={waveSvg(speaking && !paused && !muted, loudness)} alt="Voice wave" width={WIDTH} height={19} isInteractive={true} />
           ) : (
             <Text dimColor>{speaking && !paused ? '●●●●●●●●' : '········'}</Text>
           )}
         </Box>
-        {tip ? (
-          <Box alignItems="center">
-            <Button key="tip-get" label="Get natural voices" dimColor={true} onPress={() => openVoiceSettings($)} />
-            <Button key="tip-close" label="×" plain={true} dimColor={true} onPress={() => dismissTip($)} />
+        <Text> </Text>
+        {/* Volume: a button that opens the slider in the wave's place (five dots where a slider cannot be drawn). */}
+        {volumeOpen && !canSlide ? (
+          <Box flexDirection="row" alignItems="center" flexShrink={0}>
+            {DOT_LEVELS.map((step, i) => (
+              <Button
+                key={`vol-${i + 1}`}
+                label={!muted && Math.round(level * DOT_LEVELS.length) > i ? '●' : '○'}
+                plain={true}
+                onPress={() => setVolume($, step)}
+              />
+            ))}
             <Text> </Text>
           </Box>
-        ) : (
-          <Text> </Text>
-        )}
-        <Button key="voice" label={voiceLabel} onPress={() => pressVoice($)} />
+        ) : null}
+        <Button key="volume-open" label={`Volume: ${percentText}`} onPress={() => toggleVolume($)} />
+        <Text> </Text>
+        <Button key="settings" label="⚙️" dimColor={!settingsOpen && !tip} onPress={() => toggleSettings($)} />
       </Box>
     )
   })

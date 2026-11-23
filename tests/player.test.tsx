@@ -20,11 +20,13 @@ const BAR = {
   plugin: 'auto-voice',
   surface: 'desktop',
   component: 'AbovePrompt',
-  props: { hasSurvey: false, isWorking: false, maxRows: 4, bodyColumns: 120, scroll: { offset: 0, bodyRows: 4 }, view: {} },
+  props: { hasSurvey: false, isCollapsed: false, isWorking: false, maxRows: 4, bodyColumns: 120, scroll: { offset: 0, bodyRows: 4 }, view: {} },
 } as const
 
 // The world beneath the mod: a clock, and a `say` that "speaks" for SPEECH_MS unless pkill stops it.
-function world(on: any, measureMs = 0, speechMs = SPEECH_MS, voiceList = VOICE_LIST) {
+function world(on: any, measureMs = 0, speechMs = SPEECH_MS, voiceList = VOICE_LIST, ignoresVolm: string[] = []) {
+  const files = new Map<string, { text: string; voice: string | undefined }>()
+  const played: { text: string; voice: string | undefined; volume: string }[] = []
   const clock = mock.clock(on)
   mock.store(on)
   const opened: string[] = []
@@ -64,6 +66,32 @@ function world(on: any, measureMs = 0, speechMs = SPEECH_MS, voiceList = VOICE_L
       })
       return { value: OK }
     }
+    // The volume probe: a few words rendered to a file, then measured. Voices named in `ignoresVolm`
+    // come out just as loud with [[volm 0.2]] in front, as Siri voices do.
+    if (cmd === 'say' && args.includes('-o')) {
+      const v = args.indexOf('-v')
+      files.set(args[args.indexOf('-o') + 1] ?? '', { text: e.init?.stdin ?? '', voice: v >= 0 ? args[v + 1] : undefined })
+      return { value: OK }
+    }
+    if (cmd === 'python3' && args.length === 3) {
+      const f = files.get(args[2] ?? '')
+      const quiet = f?.text.startsWith('[[volm') && !ignoresVolm.includes(f.voice ?? '')
+      return { value: { ...OK, stdout: quiet ? '200\n' : '1000\n' } }
+    }
+    if (cmd === 'afplay') {
+      const f = files.get(args[2] ?? '')
+      played.push({ text: f?.text ?? '', voice: f?.voice, volume: args[1] ?? '' })
+      speechStarts.push(clock.now())
+      await new Promise<void>(done => {
+        const stop = () => {
+          playing = playing.filter(p => p !== stop)
+          done()
+        }
+        playing.push(stop)
+        void clock.sleep(speechMs).then(stop)
+      })
+      return { value: OK }
+    }
     if (cmd === 'taskpolicy') renders.push({ at: clock.now(), speechAt: speechStarts.at(-1) ?? -1 })
     if (cmd === 'taskpolicy' && measureMs > 0) await clock.sleep(measureMs)
     return { value: { ...OK, exitCode: 1 } } // measuring the sound fails here: the word estimate is used
@@ -83,6 +111,7 @@ function world(on: any, measureMs = 0, speechMs = SPEECH_MS, voiceList = VOICE_L
   return {
     clock,
     said,
+    played,
     texts: () => said.map(s => s.text.split(' ')[0]),
     isPlaying: () => playing.length > 0,
     most: () => most,
@@ -291,19 +320,26 @@ test('next on the newest section skips it, and the turn goes on', async ($, on) 
   await ui.unmount()
 })
 
-test('the voice button offers System default and only natural English voices', async ($, on) => {
+const voiceNames = async (ui: any) => {
+  const out: string[] = []
+  for (let i = 0; i < 8; i += 1) {
+    const b = await ui.find({ key: `voice-${i}` })
+    if (b) out.push(b.props.label)
+  }
+  return out
+}
+
+test('the settings button opens the voices: System default and only natural English voices', async ($, on) => {
   const w = world(on)
   const ui = await $.ui.mount(BAR)
-  expect(await label(ui, 'voice')).toBe('Voice: Default')
-  const seen: string[] = []
-  for (let i = 0; i < 5; i += 1) {
-    await ui.press({ key: 'voice' })
-    seen.push((await label(ui, 'voice')) ?? '')
-  }
+  expect(await ui.find({ key: 'voice-0' })).toBeUndefined()
+  await ui.press({ key: 'settings' })
   // Robotic (Samantha, Zarvox) and non-English (Amélie) voices are left out; at most four are offered.
-  expect(seen).toEqual(['Voice: Ava', 'Voice: Aman', 'Voice: Evan', 'Voice: Jamie', 'Voice: Default'])
-
-  await ui.press({ key: 'voice' }) // Ava
+  expect(await voiceNames(ui)).toEqual(['✓ Default', 'Ava', 'Aman', 'Evan', 'Jamie'])
+  await ui.press({ key: 'voice-1' }) // Ava
+  expect(await voiceNames(ui)).toEqual(['Default', '✓ Ava', 'Aman', 'Evan', 'Jamie'])
+  await ui.press({ key: 'settings' })
+  expect(await ui.find({ key: 'voice-0' })).toBeUndefined()
   await $.turn.start({ text: 'one', turnId: 't1' })
   const s = w.step($, reply('A1'))
   await w.clock.advance(SPEECH_MS)
@@ -348,7 +384,7 @@ test('mashing the buttons never plays two voices, and paused always means silent
     seed = (seed * 1103515245 + 12345) % 2147483648
     return seed % n
   }
-  const keys = ['prev', 'next', 'toggle', 'toggle', 'voice']
+  const keys = ['prev', 'next', 'toggle', 'toggle', 'settings']
   for (let turn = 1; turn <= 3; turn += 1) {
     await $.turn.start({ text: 'p', turnId: 't' + turn })
     for (let m = 0; m < 3; m += 1) {
@@ -447,32 +483,15 @@ test('play while muted unmutes and reads', async ($, on) => {
 
 const FEW_VOICES = ['Samantha            en_US    # Hello!', 'Aman (English (India)) en_IN    # Hi, I’m Siri!'].join('\n')
 
-test('with fewer than four natural voices, a one-time tip opens the voice settings', async ($, on) => {
+test('settings offer to get more voices, which opens the Mac voice settings', async ($, on) => {
   const w = world(on, 0, SPEECH_MS, FEW_VOICES)
   const ui = await $.ui.mount(BAR)
   await $.turn.start({ text: 'one', turnId: 't1' })
-  expect(await label(ui, 'tip-get')).toBe('Get natural voices')
+  await ui.press({ key: 'settings' })
+  expect(await voiceNames(ui)).toEqual(['✓ Default', 'Aman'])
+  expect(await label(ui, 'tip-get')).toBe('Get more voices')
   await ui.press({ key: 'tip-get' })
   expect(w.opened).toEqual(['x-apple.systempreferences:com.apple.Accessibility-Settings.extension?SpokenContent'])
-  expect(await ui.find({ key: 'tip-get' })).toBeUndefined()
-  await ui.unmount()
-})
-
-test('the tip can be closed, and stays closed', async ($, on) => {
-  const w = world(on, 0, SPEECH_MS, FEW_VOICES)
-  const ui = await $.ui.mount(BAR)
-  await $.turn.start({ text: 'one', turnId: 't1' })
-  await ui.press({ key: 'tip-close' })
-  expect(await ui.find({ key: 'tip-get' })).toBeUndefined()
-  expect(w.opened).toEqual([])
-  await ui.unmount()
-})
-
-test('with four natural voices there is no tip', async ($, on) => {
-  world(on)
-  const ui = await $.ui.mount(BAR)
-  await $.turn.start({ text: 'one', turnId: 't1' })
-  expect(await ui.find({ key: 'tip-get' })).toBeUndefined()
   await ui.unmount()
 })
 
@@ -480,7 +499,8 @@ test('the bar draws on every surface', async ($, on) => {
   world(on)
   for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
     const ui = await $.ui.mount({ ...BAR, surface })
-    expect(await label(ui, 'voice')).toBe('Voice: Default')
+    expect(await name(ui, 'settings')).toBe('⚙️')
+    expect(await name(ui, 'volume-open')).toBe('Volume: 100%')
     expect(await name(ui, 'mute')).toBe('🔊')
     await ui.unmount()
   }
@@ -513,4 +533,177 @@ test('while Claude asks a question, the bar steps aside and a status line shows 
   expect(await bar.find({ key: 'toggle' })).toBeDefined()
   expect(w.statuses.at(-1)).toBeUndefined()
   await bar.unmount()
+})
+
+// The slider fills the wave's place; laid out at 20 cells, cell 0 is 5% (its least), each cell 5%
+// more, cell 19 is 100%.
+const slide = async (ui: any, x: number) => {
+  if (!(await ui.find({ key: 'volume-slider' }))) await ui.press({ key: 'volume-open' })
+  await ui.resize({ columns: 20, rows: 1, in: 'volume-slider' })
+  await ui.pointer({ type: 'down', x, y: 0, button: 'left', in: 'volume-slider' })
+  await ui.pointer({ type: 'up', x, y: 0, button: 'left', in: 'volume-slider' })
+}
+
+test('the Volume button pops a slider out beside it; sliding sets the volume, the button closes it', async ($, on) => {
+  const w = world(on)
+  const ui = await $.ui.mount(BAR)
+  expect(await name(ui, 'volume-open')).toBe('Volume: 100%')
+  expect(await ui.find({ key: 'volume-slider' })).toBeUndefined()
+  await ui.press({ key: 'volume-open' })
+  expect(await ui.find({ key: 'volume-slider' })).toBeDefined()
+  await slide(ui, 7) // 40%
+  expect(await name(ui, 'volume-open')).toBe('Volume: 40%')
+  expect(await name(ui, 'mute')).toBe('🔉')
+  expect(await ui.find({ key: 'volume-slider' })).toBeDefined() // stays open to adjust again
+  await ui.press({ key: 'volume-open' })
+  expect(await ui.find({ key: 'volume-slider' })).toBeUndefined()
+  await $.turn.start({ text: 'one', turnId: 't1' })
+  const s = w.step($, reply('A1'))
+  await w.clock.settle()
+  expect(w.said.at(-1)?.text.startsWith('[[volm 0.40]] A1')).toBe(true)
+  await w.clock.advance(SPEECH_MS)
+  await s.finished
+  await slide(ui, 1)
+  expect(await name(ui, 'volume-open')).toBe('Volume: 10%')
+  expect(await name(ui, 'mute')).toBe('🔈')
+  await slide(ui, 40) // past the end: 100%
+  expect(await name(ui, 'mute')).toBe('🔊')
+  // A drag shows its step as it goes and sets the level when the button comes up.
+  await ui.pointer({ type: 'down', x: 19, y: 0, button: 'left', in: 'volume-slider' })
+  await ui.pointer({ type: 'move', x: 11, y: 0, button: 'left', in: 'volume-slider' })
+  expect(await name(ui, 'volume-open')).toBe('Volume: 100%')
+  await ui.pointer({ type: 'up', x: 11, y: 0, button: 'left', in: 'volume-slider' })
+  expect(await name(ui, 'volume-open')).toBe('Volume: 60%')
+  await ui.unmount()
+})
+
+test('where no slider can be drawn, the Volume button opens five dots instead', async ($, on) => {
+  world(on)
+  const ui = await $.ui.mount({ ...BAR, surface: 'vscode' })
+  await ui.press({ key: 'volume-open' })
+  await ui.press({ key: 'vol-2' })
+  expect(await name(ui, 'volume-open')).toBe('Volume: 40%')
+  expect(await ui.find({ key: 'vol-1' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('one click on the speaker still mutes, and setting a volume unmutes', async ($, on) => {
+  world(on)
+  const ui = await $.ui.mount(BAR)
+  await ui.press({ key: 'mute' })
+  expect(await name(ui, 'mute')).toBe('🔇')
+  expect(await name(ui, 'volume-open')).toBe('Volume: muted')
+  await ui.press({ key: 'mute' })
+  expect(await name(ui, 'mute')).toBe('🔊')
+  await ui.press({ key: 'mute' })
+  await slide(ui, 11)
+  expect(await name(ui, 'mute')).toBe('🔉')
+  expect(await name(ui, 'volume-open')).toBe('Volume: 60%')
+  await ui.unmount()
+})
+
+test('changing the volume while it reads pauses 2 seconds, then goes on from a few words back', async ($, on) => {
+  const w = world(on, 0, SPEECH_MS * 5)
+  const ui = await $.ui.mount(BAR)
+  await $.turn.start({ text: 'one', turnId: 't1' })
+  const words = 'A1 one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen'
+  w.step($, words + '\n\n' + para('A2'))
+  await w.clock.settle()
+  expect(w.said.length).toBe(1)
+  // Its estimated length is about 7.4 seconds; stopped 3.7 seconds in, it had reached about halfway.
+  await w.clock.advance(3700)
+  await slide(ui, 11) // 60%
+  await w.clock.settle()
+  expect(w.isPlaying()).toBe(false)
+  // Moving it again within the pause waits out that change too.
+  await w.clock.advance(1500)
+  await slide(ui, 11)
+  await w.clock.advance(1500)
+  expect(w.said.length).toBe(1)
+  await w.clock.advance(600)
+  await w.clock.settle()
+  expect(w.said.length).toBe(2)
+  const resumed = w.said.at(-1)?.text ?? ''
+  expect(resumed.startsWith('[[volm 0.60]] ')).toBe(true)
+  // One long sentence with no full stop: about halfway in, it goes back to its start.
+  const first = resumed.replace('[[volm 0.60]] ', '').split(' ')[0]
+  expect(first).toBe('A1')
+  expect(resumed.endsWith('nineteen')).toBe(true)
+  expect(w.most()).toBe(1)
+  // The next section is read whole, at the volume.
+  await w.clock.advance(SPEECH_MS * 5)
+  await w.clock.settle()
+  expect(w.said.at(-1)?.text.startsWith('[[volm 0.60]] A2')).toBe(true)
+  // Previous goes back to the very start of a section.
+  await ui.press({ key: 'prev' })
+  await w.clock.settle()
+  expect(w.said.at(-1)?.text.startsWith('[[volm 0.60]] A1 one')).toBe(true)
+  await ui.unmount()
+})
+
+test('a Siri voice that ignores the volume in the text is played through afplay at the volume', async ($, on) => {
+  const w = world(on, 0, SPEECH_MS, VOICE_LIST, ['Aman (English (India))'])
+  const ui = await $.ui.mount(BAR)
+  await ui.press({ key: 'settings' })
+  await ui.press({ key: 'voice-2' }) // Default, Ava, Aman
+  expect(await voiceNames(ui)).toContain('✓ Aman')
+  await slide(ui, 7)
+  await $.turn.start({ text: 'one', turnId: 't1' })
+  const s = w.step($, reply('A1'))
+  await w.clock.settle()
+  expect(w.said.length).toBe(0)
+  expect(w.played.at(-1)?.volume).toBe('0.40')
+  expect(w.played.at(-1)?.text.startsWith('A1')).toBe(true)
+  // Pause stops the afplay voice at once.
+  await ui.press({ key: 'toggle' })
+  await w.clock.settle()
+  expect(w.isPlaying()).toBe(false)
+  void s
+  await ui.unmount()
+})
+
+test('Volume and settings open in the same place, so opening one closes the other', async ($, on) => {
+  world(on)
+  const ui = await $.ui.mount(BAR)
+  await ui.press({ key: 'volume-open' })
+  expect(await ui.find({ key: 'volume-slider' })).toBeDefined()
+  await ui.press({ key: 'settings' })
+  expect(await ui.find({ key: 'volume-slider' })).toBeUndefined()
+  expect(await ui.find({ key: 'voice-0' })).toBeDefined()
+  await ui.press({ key: 'volume-open' })
+  expect(await ui.find({ key: 'voice-0' })).toBeUndefined()
+  expect(await ui.find({ key: 'volume-slider' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('after a volume change it reads the sentence it stopped in again, from its start', async ($, on) => {
+  const w = world(on, 0, SPEECH_MS * 5)
+  const ui = await $.ui.mount(BAR)
+  await $.turn.start({ text: 'one', turnId: 't1' })
+  w.step($, 'A1 one two three. Four five six, seven eight nine ten eleven twelve. Thirteen fourteen fifteen sixteen seventeen eighteen.')
+  await w.clock.settle()
+  await w.clock.advance(4800)
+  await slide(ui, 11)
+  await w.clock.advance(2100)
+  await w.clock.settle()
+  expect(w.said.at(-1)?.text.startsWith('[[volm 0.60]] Four five six,')).toBe(true)
+  await ui.unmount()
+})
+
+test('in a very long sentence it goes back a few words instead of to the far-off start', async ($, on) => {
+  const w = world(on, 0, 60000)
+  const ui = await $.ui.mount(BAR)
+  await $.turn.start({ text: 'one', turnId: 't1' })
+  const many = Array.from({ length: 60 }, (_, i) => `w${i}`).join(' ')
+  w.step($, 'A1 ' + many)
+  await w.clock.settle()
+  await w.clock.advance(15000) // about two thirds of the way in
+  await slide(ui, 11)
+  await w.clock.advance(2100)
+  await w.clock.settle()
+  const first = (w.said.at(-1)?.text ?? '').replace('[[volm 0.60]] ', '').split(' ')[0] ?? ''
+  const at = Number(first.slice(1))
+  expect(first.startsWith('w')).toBe(true)
+  expect(at).toBeGreaterThan(20)
+  await ui.unmount()
 })

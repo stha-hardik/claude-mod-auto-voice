@@ -10,6 +10,9 @@ declare module 'claude-code' {
       marker: string
       isMuted: boolean
       isTipShown: boolean
+      volume: number
+      isVolumeOpen: boolean
+      isSettingsOpen: boolean
     }
   }
 }

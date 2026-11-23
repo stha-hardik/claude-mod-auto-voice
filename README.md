@@ -7,11 +7,12 @@ A Claude Code mod that reads Claude's replies aloud as they appear, so you never
 ![The auto-voice bar](explainer.png)
 
 - **Every reply, read aloud** section by section, while Claude is still working.
-- **A small bar above the prompt:** 🔊 ⏮ ⏸/▶ ⏭, a section counter such as `2/3`, a row of dots that pulse with the voice, and the voice name.
+- **A small bar above the prompt:** 🔊 ⏮ ⏸/▶ ⏭, a section counter such as `2/3`, a row of dots that pulse with the voice, a **Volume** button and a **⚙️** settings button.
 - **⏮ / ⏭** move between sections of a reply, then on to the previous or next reply.
 - **⏸ / ▶** pause and resume. Pausing lasts one reply, so your next message is read again. After a reply has finished, ▶ reads it again from the start.
-- **🔊 / 🔇** mute the whole session, across replies, until you press it again. Other sessions keep talking.
-- **Voice: Default** cycles through your Mac's default voice and any natural Premium, Enhanced or Siri voices you have installed. If you have fewer than four, a one-time **Get natural voices** tip opens the right settings page.
+- **🔊 / 🔇** mute the whole session, across replies, until you press it again. Other sessions keep talking. The icon also shows the volume: 🔈 low, 🔉 medium, 🔊 high.
+- **Volume** opens a slider in place of the dots. Click or drag it to set the volume, from 5% to 100%. If it is reading, the voice pauses for 2 seconds, then reads the sentence it stopped in again, from its start, at the new volume. Click **Volume** again to close it. The level is remembered across sessions.
+- **⚙️** opens the voices in place of the dots: your Mac's default voice and any natural Premium, Enhanced or Siri voices you have installed. Click one to use it from the next section. **Get more voices** opens the settings page where you can download more. The ⚙️ shows brighter while you have fewer than four natural voices.
 - **When Claude asks a question,** the bar steps aside for the question box and a short line under the prompt shows what the voice is doing.
 
 It uses your Mac's built-in voice, so it costs no tokens and sends nothing anywhere.
