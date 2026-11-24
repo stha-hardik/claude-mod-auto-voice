@@ -1,0 +1,62 @@
+# Claude Code only sends an update to people when the version in .claude-plugin/plugin.json changes.
+# This raises the last number (1.1.0 -> 1.1.1) on every push that changes the mod's code, so each
+# change reaches everyone who turned on auto-update. A push that already changed the version is left
+# as it is, and pushes that touch only the README, images or tests are not updates.
+name: Bump version on code changes
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'hooks/**'
+      - 'types/**'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bump-version
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Raise the version unless this push already changed it
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          file=.claude-plugin/plugin.json
+          read_version() { python3 -c 'import json,sys; print(json.load(sys.stdin).get("version", ""))'; }
+          now=$(read_version < "$file")
+          was=$(git show "$BEFORE:$file" 2>/dev/null | read_version || true)
+          if [ -n "$was" ] && [ "$was" != "$now" ]; then
+            echo "The version was already changed in this push ($was -> $now)."
+            exit 0
+          fi
+          next=$(python3 - "$file" <<'PY'
+          import re, sys
+          path = sys.argv[1]
+          text = open(path).read()
+          m = re.search(r'"version"\s*:\s*"(\d+)\.(\d+)\.(\d+)"', text)
+          if not m:
+              sys.exit("No version like 1.2.3 in " + path)
+          major, minor, patch = (int(x) for x in m.groups())
+          new = f"{major}.{minor}.{patch + 1}"
+          open(path, "w").write(text[:m.start()] + f'"version": "{new}"' + text[m.end():])
+          print(new)
+          PY
+          )
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Version $next"
+          for attempt in 1 2 3; do
+            git push origin HEAD:main && exit 0
+            git pull --rebase origin main
+          done
+          exit 1

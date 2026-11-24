@@ -39,7 +39,23 @@ claude plugin install auto-voice --marketplace stha-hardik/claude-mod-auto-voice
 
 In the desktop app, where `/plugin` does not run: click + next to the prompt box, then Plugins, Add marketplace with `stha-hardik/claude-mod-auto-voice`, then Add plugin.
 
-Answer `y` to add the marketplace, then pick the user scope so it works in every session. Open a new chat afterwards.
+Answer `y` to add the marketplace, then pick the user scope so it works in every session. Open a new chat afterwards, and turn on automatic updates (below) so you get new versions.
+
+## Turn on automatic updates
+
+Claude Code doesn't update mods from other people's marketplaces on its own until you switch it on, once:
+
+1. In a Claude Code session, type `/plugin`.
+2. Open the **Marketplaces** tab and select **claude-mod-auto-voice**.
+3. Turn **auto-update** on.
+
+From then on, a few minutes after you start a session, Claude Code fetches any new version of auto-voice and shows **Plugin updated**. Run `/reload-plugins` to use it straight away, or it loads the next time you start Claude Code.
+
+To update by hand instead, run:
+
+```bash
+claude plugin update auto-voice@claude-mod-auto-voice
+```
 
 ## Get updates
 
